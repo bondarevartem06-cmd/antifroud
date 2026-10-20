@@ -1,0 +1,60 @@
+x-app: &app
+  build: .
+  image: antifraud:latest
+
+services:
+  train:                         # разово: обучение модели
+    <<: *app
+    profiles: ["train"]
+    command: python train_final.py --train data/fraudTrain.csv --out artifacts
+    volumes:
+      - ./data:/app/data:ro
+      - ./artifacts:/app/artifacts
+
+  experiments:                   # по желанию: сравнение моделей (score.py)
+    <<: *app
+    profiles: ["experiments"]
+    command: python score.py
+    environment:
+      DATA_DIR: data
+      RESULTS_DIR: results
+    volumes:
+      - ./data:/app/data:ro
+      - ./results:/app/results
+
+  api:
+    <<: *app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s          # время на загрузку модели
+
+  frontend:
+    <<: *app
+    command: streamlit run frontend.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    environment: { API_URL: "http://api:8000" }
+    ports: ["8501:8501"]
+    depends_on: { api: { condition: service_healthy } }
+
+  dashboard:
+    <<: *app
+    command: streamlit run dashboard.py --server.port 8502 --server.address 0.0.0.0 --server.headless true
+    environment: { API_URL: "http://api:8000" }
+    ports: ["8502:8502"]
+    depends_on: { api: { condition: service_healthy } }
+
+  replay:                        # по запросу: поток реальных операций
+    <<: *app
+    profiles: ["replay"]
+    entrypoint: ["python", "replay.py"]
+    command: ["--csv", "data/fraudTest.csv", "--count", "300", "--delay", "0.05"]
+    environment: { API_URL: "http://api:8000" }
+    volumes:
+      - ./data:/app/data:ro
+    depends_on: { api: { condition: service_healthy } }
