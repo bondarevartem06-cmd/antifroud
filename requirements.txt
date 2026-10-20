@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+pandas
+numpy
+scikit-learn
+lightgbm
+xgboost
+mlxtend
+joblib
+requests
+streamlit
+matplotlib
+openpyxl
