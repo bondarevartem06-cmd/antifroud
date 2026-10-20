@@ -12,7 +12,7 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import average_precision_score, confusion_matrix, precision_recall_curve, roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from compare_models import CARD, FP, USECOLS, build_base, card_features, card_items, fp_oof, make_model
@@ -63,6 +63,15 @@ prec, rec, thr = precision_recall_curve(y[i_val], p)
 f1 = 2 * prec[:-1] * rec[:-1] / np.clip(prec[:-1] + rec[:-1], 1e-9, None)
 th = float(thr[np.argmax(f1)])
 print(f"Порог по F1 на валидации: {th:.3f}, F1={f1.max():.3f}")
+
+# --- подробные метрики на валидации (20% train, случайное разбиение) ---
+yv = y[i_val]
+tn, fp_, fn, tp = confusion_matrix(yv, p >= th).ravel()
+print(f"Валидация: {len(yv):,} операций, фрода {int(yv.sum()):,} ({yv.mean():.3%})")
+print(f"ROC-AUC={roc_auc_score(yv, p):.4f}  PR-AUC={average_precision_score(yv, p):.4f} (угадайка ~{yv.mean():.4f})")
+print(f"При пороге {th:.3f}: поймано {tp} из {tp + fn} (recall {tp / max(tp + fn, 1):.1%}), "
+      f"ложных блокировок {fp_} (precision {tp / max(tp + fp_, 1):.1%})")
+print("ВНИМАНИЕ: это оценка на случайной части train; честную оценку даёт evaluate.py на fraudTest.csv")
 
 path = os.path.join(args.out, "model.joblib")
 joblib.dump({"model": model, "columns": cols, "fp_patterns": pats,
