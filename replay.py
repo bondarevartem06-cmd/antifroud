@@ -2,17 +2,23 @@
 Replay script to stream holdout transactions to the FastAPI service.
 Course: Feature Engineering - Project 3 "Real-time Anti-fraud"
 Usage:
-    python replay.py --count 100 --delay 0.1
+    python replay.py --count 100 --delay 0.1                          # синтетические операции
+    python replay.py --csv data/fraudTest.csv --count 500 --delay 0   # реальные операции из test по времени
 """
 
 import argparse
+import os
 import time
 import random
 import requests
 import pandas as pd
 import numpy as np
 
-API_URL = "http://localhost:8000"
+API_URL = os.getenv("API_URL", "http://localhost:8000")
+
+CSV_COLS = ["trans_date_trans_time", "cc_num", "category", "amt", "gender", "dob", "lat", "long",
+            "merch_lat", "merch_long", "city_pop", "state", "merchant", "is_fraud"]
+
 
 def generate_holdout_samples(n=200):
     np.random.seed(42)
@@ -25,7 +31,8 @@ def generate_holdout_samples(n=200):
         cat = "shopping_net" if is_f else str(np.random.choice(categories))
         data.append({
             "trans_date_trans_time": f"2020-06-21 {np.random.randint(0,24):02d}:{np.random.randint(0,60):02d}:{np.random.randint(0,60):02d}",
-            "cc_num": str(np.random.randint(100000000000, 999999999999, dtype='int64')),            "category": cat,
+            "cc_num": str(np.random.randint(100000000000, 999999999999, dtype='int64')),
+            "category": cat,
             "amt": round(amt, 2),
             "gender": str(np.random.choice(["M", "F"])),
             "dob": "1985-05-15",
@@ -39,10 +46,25 @@ def generate_holdout_samples(n=200):
         })
     return data
 
-def run_replay(count, delay):
+
+def load_csv_samples(path, n, start=0):
+    """Реальные операции из fraudTest.csv в порядке времени (нужно для карточных признаков)."""
+    df = pd.read_csv(path, usecols=CSV_COLS).sort_values("trans_date_trans_time", kind="stable")
+    df = df.iloc[start:start + n]
+    data = []
+    for r in df.to_dict("records"):
+        r["cc_num"] = str(r["cc_num"])
+        r["amt"] = float(r["amt"])
+        r["is_fraud"] = int(r["is_fraud"])
+        data.append(r)
+    return data
+
+
+def run_replay(count, delay, csv=None, start=0):
     print(f"🚀 Запуск симуляции потока транзакций: {count} операций с задержкой {delay}с...")
-    
-    samples = generate_holdout_samples(count)
+
+    samples = load_csv_samples(csv, count, start) if csv else generate_holdout_samples(count)
+    count = len(samples)
     sent_ok = 0
     fraud_detected = 0
 
@@ -51,7 +73,7 @@ def run_replay(count, delay):
         
         try:
             # 1. Predict
-            r_pred = requests.post(f"{API_URL}/predict", json=item, timeout=2)
+            r_pred = requests.post(f"{API_URL}/predict", json=item, timeout=5)
             if r_pred.status_code == 200:
                 p_data = r_pred.json()
                 tx_id = p_data["transaction_id"]
@@ -65,7 +87,7 @@ def run_replay(count, delay):
                     status_str = f"✅ ЧЕСТНАЯ ({score*100:.1f}%)"
 
                 # 2. Label
-                requests.post(f"{API_URL}/label", json={"transaction_id": tx_id, "is_fraud": is_fraud_fact}, timeout=2)
+                requests.post(f"{API_URL}/label", json={"transaction_id": tx_id, "is_fraud": is_fraud_fact}, timeout=5)
                 
                 sent_ok += 1
                 print(f"[{i:03d}/{count}] Tx: {tx_id[:8]} | Amt: {item['amt']:7.2f} у.е. | Модель: {status_str} | Факт: {is_fraud_fact}")
@@ -83,6 +105,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Replay holdout stream to Anti-Fraud API")
     parser.add_argument("--count", type=int, default=50, help="Количество операций")
     parser.add_argument("--delay", type=float, default=0.1, help="Задержка между операциями в сек")
+    parser.add_argument("--csv", default=None, help="Путь к fraudTest.csv (реальные операции вместо синтетических)")
+    parser.add_argument("--start", type=int, default=0, help="Смещение в отсортированном по времени CSV")
     args = parser.parse_args()
     
-    run_replay(args.count, args.delay)
+    run_replay(args.count, args.delay, args.csv, args.start)
