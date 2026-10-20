@@ -1,0 +1,7 @@
+data/
+artifacts/
+results/
+out_*/
+*.csv
+__pycache__/
+.git/
