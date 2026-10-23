@@ -49,7 +49,7 @@ rate = y.mean()
 print("\n" + "=" * 60)
 print(f"Операций в test: {len(y):,}, мошеннических: {int(y.sum()):,} ({rate:.3%})")
 print(f"ROC-AUC: {roc_auc_score(y, p):.4f}")
-print(f"PR-AUC:  {average_precision_score(y, p):.4f}   (модель-угадайка дала бы ~{rate:.4f})")
+print(f"PR-AUC:  {average_precision_score(y, p):.4f}   (случайное угадывание дало бы ~{rate:.4f})")
 
 
 def report(th, name):
