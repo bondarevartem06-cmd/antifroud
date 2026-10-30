@@ -212,6 +212,23 @@ def get_metrics():
     fact_positives = sum(1 for tx in labeled_txs if tx["is_fraud_fact"] == 1)
     fraud_rate_fact = (fact_positives / len(labeled_txs) * 100) if len(labeled_txs) > 0 else 0.0
 
+    # Качество решений модели по размеченным операциям (матрица ошибок)
+    def outcome(tx):
+        pred, fact = tx["is_fraud_pred"], tx["is_fraud_fact"]
+        return "tp" if (pred and fact) else "fp" if pred else "fn" if fact else "tn"
+
+    def quality(txs):
+        c = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+        for tx in txs:
+            c[outcome(tx)] += 1
+        n = len(txs)
+        acc = (c["tp"] + c["tn"]) / n * 100 if n else None
+        prec = c["tp"] / (c["tp"] + c["fp"]) * 100 if (c["tp"] + c["fp"]) else None
+        rec = c["tp"] / (c["tp"] + c["fn"]) * 100 if (c["tp"] + c["fn"]) else None
+        return c, acc, prec, rec
+
+    confusion, accuracy, precision, recall = quality(labeled_txs)
+
     # Формируем временной ряд (батчи по 10 транзакций)
     time_series = []
     batch_size = 10
@@ -222,12 +239,16 @@ def get_metrics():
         b_labeled = [tx for tx in ok_txs if tx["is_fraud_fact"] is not None]
         b_fact_fr = (sum(1 for tx in b_labeled if tx["is_fraud_fact"] == 1) / len(b_labeled) * 100) if b_labeled else 0.0
         
+        b_conf, b_acc, _, _ = quality(b_labeled)
         time_series.append({
             "batch_index": i // batch_size + 1,
             "timestamp": batch[-1]["timestamp"],
             "fraud_rate_model": round(b_model_fr, 2),
             "fraud_rate_fact": round(b_fact_fr, 2),
-            "success_rate": round(len(ok_txs) / len(batch) * 100, 2)  # доля успешных запросов в пачке
+            "success_rate": round(len(ok_txs) / len(batch) * 100, 2),  # доступность: доля успешных запросов в пачке
+            "decision_accuracy": round(b_acc, 2) if b_acc is not None else None,  # доля верных решений модели
+            "false_positives": b_conf["fp"],   # честные операции, заблокированные моделью
+            "false_negatives": b_conf["fn"]    # пропущенный фрод
         })
 
     # Последние срабатывания (где модель предсказала фрод)
@@ -244,6 +265,20 @@ def get_metrics():
         for tx in reversed(TRANSACTION_LOG) if tx["is_fraud_pred"] == 1
     ][:15]
 
+    # Последние ошибки модели: решение не совпало с фактической меткой
+    recent_errors = [
+        {
+            "transaction_id": tx["transaction_id"],
+            "timestamp": tx["timestamp"],
+            "amt": tx["amt"],
+            "category": tx["category"],
+            "fraud_score": tx["fraud_score"],
+            "error_type": "Ложная блокировка" if tx["is_fraud_pred"] == 1 else "Пропущенный фрод",
+            "reasons": ", ".join(tx["reasons"]),
+        }
+        for tx in reversed(labeled_txs) if tx["is_fraud_pred"] != tx["is_fraud_fact"]
+    ][:15]
+
     return {
         "total_requests": total_requests,
         "success_requests": success_requests,
@@ -254,5 +289,10 @@ def get_metrics():
         "labeled_count": len(labeled_txs),
         "current_threshold": CURRENT_THRESHOLD,
         "time_series": time_series,
-        "recent_frauds": recent_frauds
+        "recent_frauds": recent_frauds,
+        "confusion": confusion,
+        "accuracy": round(accuracy, 2) if accuracy is not None else None,
+        "precision": round(precision, 2) if precision is not None else None,
+        "recall": round(recall, 2) if recall is not None else None,
+        "recent_errors": recent_errors
     }
