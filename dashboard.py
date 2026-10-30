@@ -72,10 +72,21 @@ else:
     
     # Success Rate Alarm
     succ_color = "normal" if succ_rate >= 95.0 else "inverse"
-    kpi2.metric("Success Rate", f"{succ_rate:.1f}%", delta="ОК" if succ_rate >= 95 else "ТРЕВОГА!", delta_color=succ_color)
+    kpi2.metric("Доступность (Success Rate)", f"{succ_rate:.1f}%", delta="ОК" if succ_rate >= 95 else "ТРЕВОГА!", delta_color=succ_color)
     
     kpi3.metric("Fraud Rate (Модель)", f"{fr_model:.2f}%", delta=f"Порог {metrics_data['current_threshold']:.2f}")
     kpi4.metric("Fraud Rate (Факт)", f"{fr_fact:.2f}%", delta=f"{labeled} размечено")
+
+    # Качество решений модели по операциям с фактической меткой (отдельно от доступности сервиса)
+    conf = metrics_data.get("confusion", {})
+    def pct(v):
+        return f"{v:.1f}%" if v is not None else "—"
+
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Верные решения (Accuracy)", pct(metrics_data.get("accuracy")), delta=f"{labeled} размечено", delta_color="off")
+    q2.metric("Precision (блокировки по делу)", pct(metrics_data.get("precision")))
+    q3.metric("Recall (найдено фрода)", pct(metrics_data.get("recall")))
+    q4.metric("Ложные блокировки / Пропуски", f"{conf.get('fp', 0)} / {conf.get('fn', 0)}")
 
     # Alarm Banner if discrepancy is large
     if labeled >= 10 and abs(fr_model - fr_fact) > 2.0:
@@ -109,6 +120,15 @@ else:
                 y="success_rate",
                 color="#00C853"
             )
+
+        df_ts["decision_accuracy"] = pd.to_numeric(df_ts["decision_accuracy"])  # None -> NaN
+        col_chart3, col_chart4 = st.columns(2)
+        with col_chart3:
+            st.subheader("🎯 Верные решения модели (Accuracy %)")
+            st.line_chart(df_ts, x="batch_index", y="decision_accuracy", color="#AB47BC")
+        with col_chart4:
+            st.subheader("❌ Ошибки модели по батчам")
+            st.bar_chart(df_ts, x="batch_index", y=["false_positives", "false_negatives"], color=["#FF9800", "#E53935"])
     else:
         st.info("💡 Отправьте транзакции через интерфейс оператора, чтобы увидеть графики динамики.")
 
@@ -137,6 +157,31 @@ else:
         )
     else:
         st.success("На данный момент заблокированных подозрительных операций нет.")
+
+    st.markdown("---")
+
+    # ----------------------------------------------------------------------------
+    # Ошибки модели: решение не совпало с фактической меткой
+    # ----------------------------------------------------------------------------
+    st.subheader("⚠️ Ошибки модели (расхождение с фактической меткой)")
+    recent_errors = metrics_data.get("recent_errors", [])
+    if recent_errors:
+        df_err = pd.DataFrame(recent_errors)
+        st.dataframe(
+            df_err[["timestamp", "amt", "category", "fraud_score", "error_type", "reasons"]],
+            column_config={
+                "timestamp": "Время",
+                "amt": st.column_config.NumberColumn("Сумма (у.е.)", format="%.2f"),
+                "category": "Категория",
+                "fraud_score": st.column_config.ProgressColumn("Скор Фрода", min_value=0.0, max_value=1.0, format="%.4f"),
+                "error_type": "Тип ошибки",
+                "reasons": "Главные признаки (вклад в решение)"
+            },
+            use_container_width=True,
+            height=300
+        )
+    else:
+        st.success("Ошибок модели среди размеченных операций пока нет.")
 
 # Auto Refresh loop
 if auto_refresh:
