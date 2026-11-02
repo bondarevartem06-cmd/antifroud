@@ -67,6 +67,7 @@ def run_replay(count, delay, csv=None, start=0):
     count = len(samples)
     sent_ok = 0
     fraud_detected = 0
+    tp = fp = fn = tn = 0  # матрица ошибок по фактическим меткам серии
 
     for i, item in enumerate(samples, 1):
         is_fraud_fact = item.pop("is_fraud")
@@ -89,6 +90,15 @@ def run_replay(count, delay, csv=None, start=0):
                 # 2. Label
                 requests.post(f"{API_URL}/label", json={"transaction_id": tx_id, "is_fraud": is_fraud_fact}, timeout=5)
                 
+                if pred == 1 and is_fraud_fact == 1:
+                    tp += 1      # фрод пойман
+                elif pred == 1:
+                    fp += 1      # честная операция заблокирована
+                elif is_fraud_fact == 1:
+                    fn += 1      # фрод пропущен
+                else:
+                    tn += 1      # честная пропущена верно
+
                 sent_ok += 1
                 print(f"[{i:03d}/{count}] Tx: {tx_id[:8]} | Amt: {item['amt']:7.2f} у.е. | Модель: {status_str} | Факт: {is_fraud_fact}")
             else:
@@ -100,6 +110,20 @@ def run_replay(count, delay, csv=None, start=0):
 
     print("\n" + "="*50)
     print(f"🎉 Симуляция завершена! Успешно отправлено: {sent_ok}/{count}. Модель заблокировала: {fraud_detected} операций.")
+
+    # --- качество решений модели в этой серии ---
+    n = tp + fp + fn + tn
+    if n:
+        def pct(v):
+            return f"{v:.1%}" if v is not None else "—"
+        precision = tp / (tp + fp) if (tp + fp) else None
+        recall = tp / (tp + fn) if (tp + fn) else None
+        f1 = 2 * precision * recall / (precision + recall) if (precision and recall) else None
+        print(f"\nФактического фрода в серии: {tp + fn} из {n} ({(tp + fn) / n:.2%})")
+        print(f"Поймано: {tp} | Ложных блокировок: {fp} | Пропущено фрода: {fn} | Верных пропусков: {tn}")
+        print(f"Accuracy: {(tp + tn) / n:.2%} | Precision: {pct(precision)} | Recall: {pct(recall)} | F1: {pct(f1)}")
+        if tp + fn == 0:
+            print("В серии нет мошеннических операций, поэтому recall посчитать нельзя. Увеличьте --count или измените --start.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Replay holdout stream to Anti-Fraud API")
