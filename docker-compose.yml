@@ -1,8 +1,113 @@
 x-app: &app
-  build: .
+  build:
+    context: .
+    target: app
   image: antifraud:latest
 
+# Параметры подключения к БД; значения берутся из файла .env
+x-db-env: &db-env
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:-antifraud}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+  POSTGRES_DB: ${POSTGRES_DB:-antifraud}
+
 services:
+  db:                            # PostgreSQL, данные в именованном томе pgdata
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-antifraud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-antifraud}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  migrate:                       # разовый контейнер: применяет миграции Alembic и завершается
+    <<: *app
+    command: alembic upgrade head
+    environment: *db-env
+    volumes:
+      - ./alembic:/app/alembic   # новые миграции, созданные в контейнере, остаются на вашем компьютере
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+
+  adminer:                       # веб-интерфейс для просмотра базы: http://localhost:8080
+    image: adminer:4
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    ports: ["127.0.0.1:8080:8080"]   # только с этого компьютера
+    depends_on:
+      db: { condition: service_healthy }
+
+  ollama:                        # компактная языковая модель для резюме; при первом запуске скачивает модель
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        ollama pull "$$OLLAMA_MODEL"
+        wait
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:                 # healthy только после того, как модель скачана
+      test: ["CMD-SHELL", "ollama list | grep -q \"$$OLLAMA_MODEL\""]
+      interval: 15s
+      timeout: 10s
+      retries: 120
+      start_period: 60s
+
+  airflow:                       # оркестратор: scheduler + webserver в одном контейнере; интерфейс http://localhost:8081
+    build:
+      context: .
+      target: airflow
+    image: antifraud-airflow:latest
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Set AIRFLOW_ADMIN_PASSWORD in .env}
+      MODEL_PATH: /app/artifacts/model.joblib
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      REPORT_ALLOW_TEMPLATE_FALLBACK: "1"   # 0 = без шаблонного резюме: DAG падает, если LLM не прошла проверку
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./artifacts:/app/artifacts:ro
+      - airflow_logs:/opt/airflow/logs
+    ports: ["127.0.0.1:8081:8080"]
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+      ollama: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  holdout-loader:                # разово: загрузка отложенной выборки fraudTest.csv в PostgreSQL
+    <<: *app
+    profiles: ["tools"]
+    command: python load_holdout.py --csv data/fraudTest.csv
+    environment: *db-env
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
   train:                         # разово: обучение модели
     <<: *app
     profiles: ["train"]
@@ -25,9 +130,13 @@ services:
   api:
     <<: *app
     command: uvicorn main:app --host 0.0.0.0 --port 8000
+    environment: *db-env
     volumes:
       - ./artifacts:/app/artifacts:ro
     ports: ["8000:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -58,3 +167,8 @@ services:
     volumes:
       - ./data:/app/data:ro
     depends_on: { api: { condition: service_healthy } }
+
+volumes:
+  pgdata:
+  ollama_data:
+  airflow_logs:

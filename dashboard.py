@@ -29,6 +29,15 @@ def fetch_metrics():
         pass
     return None
 
+def fetch_report():
+    try:
+        r = requests.get(f"{API_URL}/reports/latest", timeout=3)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
 # Sidebar Controls
 st.sidebar.header("⚙️ Настройки панели")
 auto_refresh = st.sidebar.checkbox("Включить автообновление (каждые 5 сек)", value=True)
@@ -182,6 +191,43 @@ else:
         )
     else:
         st.success("Ошибок модели среди размеченных операций пока нет.")
+
+    # ----------------------------------------------------------------------------
+    # Бизнес-отчёт по результатам прескоринга (формируется DAG-ом Airflow, GET /reports/latest)
+    # ----------------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("📑 Бизнес-отчёт по результатам прескоринга")
+    report = fetch_report()
+    if not report:
+        st.info("Проверенных отчётов пока нет. Запустите DAG `antifraud_prescoring_report` в Airflow (http://localhost:8081).")
+    else:
+        rm = report["metrics"]
+        cur = rm.get("currency", "USD")
+
+        def money(v):
+            return f"{v:,.2f}".replace(",", " ") + f" {cur}"
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Предотвращённые потери", money(rm["prevented_loss"]),
+                  delta=f"{rm['loss_reduction_pct']:.1f}% потерь предотвращено", delta_color="off")
+        r2.metric("Понесённые потери", money(rm["incurred_loss"]), delta=f"{rm['fn']} пропусков", delta_color="off")
+        r3.metric("Стоимость ложных срабатываний", money(rm["fp_cost"]), delta=f"{rm['fp']} блокировок", delta_color="off")
+        r4.metric("Чистый эффект", money(rm["net_effect"]), delta=f"ручные проверки: {money(rm['review_cost'])}", delta_color="off")
+
+        st.markdown("**Резюме для руководства:**")
+        st.write(report["summary"])
+        source = "языковая модель" if report.get("summary_source") == "llm" else "шаблон (языковая модель не прошла проверку чисел)"
+        st.caption(
+            f"Источник резюме: {source} ({report.get('llm_model')}) | проверено: {report.get('verified_at')} | "
+            f"версия модели скоринга: {report.get('model_version')} | порог: {report.get('threshold'):.3f} | "
+            f"операций в выборке: {report.get('holdout_rows'):,}"
+        )
+        with st.expander("Допущения расчёта"):
+            for rule in report["assumptions"].get("rules", []):
+                st.write("•", rule)
+            st.json(report["assumptions"].get("parameters", {}))
+        with st.expander("Результаты автоматической проверки чисел"):
+            st.json(report.get("validation", {}).get("checks", {}))
 
 # Auto Refresh loop
 if auto_refresh:

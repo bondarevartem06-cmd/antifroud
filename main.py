@@ -2,25 +2,34 @@
 FastAPI Anti-Fraud Real-Time Scoring Service
 Course: Feature Engineering - Project 3 "Real-time Anti-fraud"
 Скоринг выполняет обученная модель (artifacts/model.joblib, см. train_final.py и serving.py).
+Каждый запрос (в том числе ошибочный), каждое решение и каждая метка пишутся в PostgreSQL (см. db.py),
+а /metrics считает показатели SQL-запросами к базе.
 """
 
 import os
+import sys
+import time
 from datetime import datetime
-from typing import Dict, List, Optional, Any
-from uuid import uuid4
+from typing import List, Optional
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, status, Request
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import db
 from serving import Scorer
 
 app = FastAPI(
     title="Real-Time Anti-Fraud Scoring API",
     description="API для скоринга транзакций в реальном времени, приема меток и сбора метрик мониторинга.",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 # Enable CORS for browser frontend if needed
@@ -35,16 +44,13 @@ app.add_middleware(
 # Обученная модель + история карт (загружается один раз при старте)
 scorer = Scorer(os.getenv("MODEL_PATH", "artifacts/model.joblib"))
 
-# Global State: порог по умолчанию берётся из обучения (максимум F1 на валидации)
+# Рабочий порог хранится в памяти процесса; по умолчанию берётся из обучения (максимум F1 на валидации).
+# Каждое решение сохраняет в БД порог, с которым оно принято.
 DEFAULT_THRESHOLD = scorer.threshold
 CURRENT_THRESHOLD = DEFAULT_THRESHOLD
 
-# In-memory transaction and metrics logs
-# In production this would be backed by PostgreSQL/SQLite
-TRANSACTION_LOG: List[Dict[str, Any]] = []
-ERROR_LOG: List[Dict[str, Any]] = []
-# Единый журнал запросов /predict (успехи и ошибки по порядку): из него считается доступность
-REQUEST_LOG: List[Dict[str, Any]] = []  # {"timestamp", "ok", "tx": запись из TRANSACTION_LOG или None}
+# Эндпоинты, запросы к которым попадают в журнал (мониторинговые /health и /metrics не логируем)
+LOGGED_PATHS = {"/predict", "/label", "/threshold"}
 
 # ----------------------------------------------------------------------------
 # Pydantic Schemas
@@ -73,31 +79,76 @@ class PredictResponse(BaseModel):
 
 class LabelInput(BaseModel):
     transaction_id: str
-    is_fraud: int = Field(..., description="1 = Мошенничество, 0 = Честная операция")
+    is_fraud: int = Field(..., ge=0, le=1, description="1 = Мошенничество, 0 = Честная операция")
 
 class ThresholdInput(BaseModel):
     threshold: float = Field(..., ge=0.0, le=1.0, description="Новый порог срабатывания (от 0 до 1)")
 
 # ----------------------------------------------------------------------------
-# Error Handlers
+# Журнал запросов (middleware) и обработчики ошибок
 # ----------------------------------------------------------------------------
-def log_failure(request: Request, kind: str, detail: str):
-    now = datetime.now().isoformat()
-    ERROR_LOG.append({"timestamp": now, "type": kind, "detail": detail})
-    if request.url.path == "/predict":  # неуспешный запрос скоринга
-        REQUEST_LOG.append({"timestamp": now, "ok": False, "tx": None})
+@app.middleware("http")
+async def audit_log(request: Request, call_next):
+    """Пишет в таблицу requests каждый запрос к бизнес-эндпоинтам, в том числе ошибочный."""
+    if request.url.path not in LOGGED_PATHS:
+        return await call_next(request)
+
+    request_id = uuid4()
+    request.state.request_id = request_id
+    request.state.payload = None
+    request.state.error_type = None
+    request.state.error_detail = None
+    client_ip = request.client.host if request.client else None
+    started = time.perf_counter()
+
+    try:
+        await run_in_threadpool(db.request_started, request_id, request.method, request.url.path, client_ip)
+    except Exception as exc:  # без журнала решения не принимаем: аудит обязателен
+        print(f"[audit] БД недоступна: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return JSONResponse(status_code=503, content={"detail": "Database unavailable"})
+
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception as exc:  # необработанная ошибка: ответ 500 сформирует global_exception_handler
+        request.state.error_type = "500_internal_error"
+        request.state.error_detail = str(exc)
+        raise
+    finally:
+        error_type = request.state.error_type
+        if status_code >= 400 and error_type is None:
+            error_type = f"{status_code}_error"
+        try:
+            await run_in_threadpool(
+                db.request_finished, request_id, status_code,
+                (time.perf_counter() - started) * 1000, error_type,
+                request.state.error_detail, request.state.payload,
+            )
+        except Exception as exc:
+            print(f"[audit] не удалось записать итог запроса: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    log_failure(request, "422_validation_error", str(exc))
+    request.state.error_type = "422_validation_error"
+    request.state.error_detail = str(exc)
+    request.state.payload = exc.body  # то, что прислал клиент
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": "Validation Error", "errors": exc.errors()}
+        status_code=422,
+        content={"detail": "Validation Error", "errors": jsonable_encoder(exc.errors())}
     )
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    request.state.error_type = f"{exc.status_code}_http_error"
+    request.state.error_detail = str(exc.detail)
+    return await http_exception_handler(request, exc)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    log_failure(request, "500_internal_error", str(exc))
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": f"Internal Server Error: {str(exc)}"}
@@ -119,71 +170,80 @@ def calculate_score_and_reasons(tx: TransactionInput) -> tuple[float, List[str]]
 # ----------------------------------------------------------------------------
 @app.get("/health", summary="Проверка состояния сервиса")
 def get_health():
-    """Возвращает статус готовности модели и сервиса."""
+    """Статус сервиса и базы данных. При недоступной БД отвечает 503."""
+    try:
+        db.ping()
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={
+            "status": "degraded", "db": "error", "detail": type(exc).__name__})
     return {
         "status": "ok",
         "service": "antifraud_scoring",
         "timestamp": datetime.now().isoformat(),
         "model_loaded": scorer.model is not None,
+        "db": "ok",
         "current_threshold": CURRENT_THRESHOLD
     }
 
 @app.post("/predict", response_model=PredictResponse, summary="Скоринг одиночной транзакции")
-def predict_transaction(tx: TransactionInput):
+def predict_transaction(tx: TransactionInput, request: Request):
     """
-    Принимает одну транзакцию, рассчитывает признаки и возвращает решение и причины.
+    Принимает одну транзакцию, рассчитывает признаки, сохраняет решение в БД
+    и возвращает решение и причины.
     """
-    tx_id = str(uuid4())
+    request.state.payload = tx.model_dump()
+    tx_id = uuid4()
     score, reasons = calculate_score_and_reasons(tx)
-    is_fraud_pred = int(score >= CURRENT_THRESHOLD)
+    threshold = CURRENT_THRESHOLD
+    is_fraud_pred = score >= threshold
 
-    log_entry = {
+    db.insert_decision({
         "transaction_id": tx_id,
-        "timestamp": datetime.now().isoformat(),
-        "trans_date_trans_time": tx.trans_date_trans_time,
+        "request_id": request.state.request_id,
+        "trans_time": tx.trans_date_trans_time,
         "cc_num": tx.cc_num,
         "amt": tx.amt,
         "category": tx.category,
-        "fraud_score": round(score, 4),
+        "fraud_score": score,
         "is_fraud_pred": is_fraud_pred,
-        "threshold": CURRENT_THRESHOLD,
-        "is_fraud_fact": None,  # заполняется позже через /label
+        "threshold": threshold,
         "reasons": reasons,
-        "status": "ok"
-    }
-    TRANSACTION_LOG.append(log_entry)
-    REQUEST_LOG.append({"timestamp": log_entry["timestamp"], "ok": True, "tx": log_entry})
+    })
 
     return PredictResponse(
-        transaction_id=tx_id,
+        transaction_id=str(tx_id),
         fraud_score=round(score, 4),
-        is_fraud_pred=is_fraud_pred,
-        threshold=CURRENT_THRESHOLD,
+        is_fraud_pred=int(is_fraud_pred),
+        threshold=threshold,
         reasons=reasons
     )
 
 @app.post("/label", summary="Обновление фактической метки фрода")
-def label_transaction(payload: LabelInput):
+def label_transaction(payload: LabelInput, request: Request):
     """
     Привязывает подтвержденный факт мошенничества (0 или 1) к ранее оцененной транзакции.
     """
-    for entry in reversed(TRANSACTION_LOG):
-        if entry["transaction_id"] == payload.transaction_id:
-            entry["is_fraud_fact"] = payload.is_fraud
-            return {
-                "status": "ok",
-                "message": f"Label {payload.is_fraud} attached to transaction {payload.transaction_id}"
-            }
-    
-    raise HTTPException(
+    request.state.payload = payload.model_dump()
+    not_found = HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Transaction ID {payload.transaction_id} not found in log."
+        detail=f"Transaction ID {payload.transaction_id} not found."
     )
+    try:
+        tx_uuid = UUID(payload.transaction_id)
+    except ValueError:
+        raise not_found
+    if not db.upsert_label(tx_uuid, bool(payload.is_fraud), request.state.request_id):
+        raise not_found
+    return {
+        "status": "ok",
+        "message": f"Label {payload.is_fraud} attached to transaction {payload.transaction_id}"
+    }
 
 @app.put("/threshold", summary="Динамическое изменение порога")
-def update_threshold(payload: ThresholdInput):
+def update_threshold(payload: ThresholdInput, request: Request):
     """Изменяет рабочий порог принятия решений без перезапуска сервиса."""
     global CURRENT_THRESHOLD
+    request.state.payload = payload.model_dump()
     old_threshold = CURRENT_THRESHOLD
     CURRENT_THRESHOLD = payload.threshold
     return {
@@ -192,107 +252,24 @@ def update_threshold(payload: ThresholdInput):
         "new_threshold": CURRENT_THRESHOLD
     }
 
+@app.get("/reports/latest", summary="Последний проверенный бизнес-отчёт")
+def latest_report():
+    """
+    Бизнес-отчёт по результатам прескоринга: финансовые показатели, резюме для руководства, допущения и
+    результаты автоматической проверки чисел. Формируется DAG-ом Airflow antifraud_prescoring_report;
+    отдаётся только отчёт со статусом verified.
+    """
+    report = db.get_latest_report()
+    if report is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Проверенных отчётов пока нет. Запустите DAG antifraud_prescoring_report в Airflow."
+        )
+    return report
+
 @app.get("/metrics", summary="Метрики для панели мониторинга")
 def get_metrics():
     """
-    Возвращает сводную статистику работы сервиса для панели мониторинга.
+    Сводная статистика для панели мониторинга. Все показатели считаются SQL-запросами к PostgreSQL.
     """
-    total_requests = len(REQUEST_LOG)  # все запросы /predict
-    success_requests = sum(1 for r in REQUEST_LOG if r["ok"])
-    error_count = total_requests - success_requests
-
-    success_rate = (success_requests / total_requests * 100) if total_requests > 0 else 100.0
-
-    # Fraud rate по модели
-    model_positives = sum(1 for tx in TRANSACTION_LOG if tx["is_fraud_pred"] == 1)
-    fraud_rate_model = (model_positives / success_requests * 100) if success_requests > 0 else 0.0
-
-    # Fraud rate фактический (по размеченным)
-    labeled_txs = [tx for tx in TRANSACTION_LOG if tx["is_fraud_fact"] is not None]
-    fact_positives = sum(1 for tx in labeled_txs if tx["is_fraud_fact"] == 1)
-    fraud_rate_fact = (fact_positives / len(labeled_txs) * 100) if len(labeled_txs) > 0 else 0.0
-
-    # Качество решений модели по размеченным операциям (матрица ошибок)
-    def outcome(tx):
-        pred, fact = tx["is_fraud_pred"], tx["is_fraud_fact"]
-        return "tp" if (pred and fact) else "fp" if pred else "fn" if fact else "tn"
-
-    def quality(txs):
-        c = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
-        for tx in txs:
-            c[outcome(tx)] += 1
-        n = len(txs)
-        acc = (c["tp"] + c["tn"]) / n * 100 if n else None
-        prec = c["tp"] / (c["tp"] + c["fp"]) * 100 if (c["tp"] + c["fp"]) else None
-        rec = c["tp"] / (c["tp"] + c["fn"]) * 100 if (c["tp"] + c["fn"]) else None
-        return c, acc, prec, rec
-
-    confusion, accuracy, precision, recall = quality(labeled_txs)
-
-    # Формируем временной ряд (батчи по 10 транзакций)
-    time_series = []
-    batch_size = 10
-    for i in range(0, len(REQUEST_LOG), batch_size):
-        batch = REQUEST_LOG[i:i+batch_size]
-        ok_txs = [r["tx"] for r in batch if r["ok"]]  # записи успешных запросов пачки
-        b_model_fr = (sum(1 for tx in ok_txs if tx["is_fraud_pred"] == 1) / len(ok_txs) * 100) if ok_txs else 0.0
-        b_labeled = [tx for tx in ok_txs if tx["is_fraud_fact"] is not None]
-        b_fact_fr = (sum(1 for tx in b_labeled if tx["is_fraud_fact"] == 1) / len(b_labeled) * 100) if b_labeled else 0.0
-        
-        b_conf, b_acc, _, _ = quality(b_labeled)
-        time_series.append({
-            "batch_index": i // batch_size + 1,
-            "timestamp": batch[-1]["timestamp"],
-            "fraud_rate_model": round(b_model_fr, 2),
-            "fraud_rate_fact": round(b_fact_fr, 2),
-            "success_rate": round(len(ok_txs) / len(batch) * 100, 2),  # доступность: доля успешных запросов в пачке
-            "decision_accuracy": round(b_acc, 2) if b_acc is not None else None,  # доля верных решений модели
-            "false_positives": b_conf["fp"],   # честные операции, заблокированные моделью
-            "false_negatives": b_conf["fn"]    # пропущенный фрод
-        })
-
-    # Последние срабатывания (где модель предсказала фрод)
-    recent_frauds = [
-        {
-            "transaction_id": tx["transaction_id"],
-            "timestamp": tx["timestamp"],
-            "amt": tx["amt"],
-            "category": tx["category"],
-            "fraud_score": tx["fraud_score"],
-            "reasons": ", ".join(tx["reasons"]),
-            "is_fraud_fact": tx["is_fraud_fact"] if tx["is_fraud_fact"] is not None else "Ожидает метку"
-        }
-        for tx in reversed(TRANSACTION_LOG) if tx["is_fraud_pred"] == 1
-    ][:15]
-
-    # Последние ошибки модели: решение не совпало с фактической меткой
-    recent_errors = [
-        {
-            "transaction_id": tx["transaction_id"],
-            "timestamp": tx["timestamp"],
-            "amt": tx["amt"],
-            "category": tx["category"],
-            "fraud_score": tx["fraud_score"],
-            "error_type": "Ложная блокировка" if tx["is_fraud_pred"] == 1 else "Пропущенный фрод",
-            "reasons": ", ".join(tx["reasons"]),
-        }
-        for tx in reversed(labeled_txs) if tx["is_fraud_pred"] != tx["is_fraud_fact"]
-    ][:15]
-
-    return {
-        "total_requests": total_requests,
-        "success_requests": success_requests,
-        "error_count": error_count,
-        "success_rate": round(success_rate, 2),
-        "fraud_rate_model": round(fraud_rate_model, 2),
-        "fraud_rate_fact": round(fraud_rate_fact, 2),
-        "labeled_count": len(labeled_txs),
-        "current_threshold": CURRENT_THRESHOLD,
-        "time_series": time_series,
-        "recent_frauds": recent_frauds,
-        "confusion": confusion,
-        "accuracy": round(accuracy, 2) if accuracy is not None else None,
-        "precision": round(precision, 2) if precision is not None else None,
-        "recall": round(recall, 2) if recall is not None else None,
-        "recent_errors": recent_errors
-    }
+    return db.compute_metrics(CURRENT_THRESHOLD)
